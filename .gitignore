@@ -1,0 +1,26 @@
+# ----- OAuth credentials (never commit these) -----
+credentials.json
+token.json
+
+# ----- Compiled binary -----
+gcontacts-sync
+gcontacts-sync.exe
+
+# ----- Contact data (the whole point of the tool — keep it local) -----
+contacts/
+
+# ----- Go toolchain -----
+*.test
+*.out
+/vendor/
+
+# ----- OS clutter -----
+.DS_Store
+Thumbs.db
+
+# ----- Editor metadata -----
+.idea/
+.vscode/
+*.swp
+*.swo
+
