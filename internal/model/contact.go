@@ -55,6 +55,10 @@ type Contact struct {
 	// Used to detect local edits without relying on filesystem mtimes.
 	SyncedHash string `yaml:"synced_hash,omitempty"`
 
+	// FilePath is the absolute path to the markdown file this contact was read
+	// from. Set by Store.ReadAll/Read; not persisted to the file itself.
+	FilePath string `yaml:"-"`
+
 	// --- Notes (body of the markdown file) ---
 	Notes string `yaml:"-"`
 }

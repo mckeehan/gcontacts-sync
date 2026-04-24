@@ -72,13 +72,28 @@ func (s *Store) Write(c *model.Contact) error {
 	return os.WriteFile(s.Path(c), data, 0o644)
 }
 
+// WriteToPath serialises a Contact to an explicit path rather than the
+// canonical path derived from the contact's display name.
+func (s *Store) WriteToPath(path string, c *model.Contact) error {
+	data, err := Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
 // Read parses a Markdown file at path into a Contact.
 func (s *Store) Read(path string) (*model.Contact, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return Unmarshal(data)
+	c, err := Unmarshal(data)
+	if err != nil {
+		return nil, err
+	}
+	c.FilePath = path
+	return c, nil
 }
 
 // ListPaths returns all .md file paths in the store directory.

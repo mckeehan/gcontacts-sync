@@ -23,6 +23,7 @@ func main() {
 		pushOnly      = flag.Bool("push", false, "Only push from Markdown → Google Contacts")
 		verbose       = flag.Bool("verbose", false, "Verbose logging")
 		deleteOrphans = flag.Bool("delete-orphans", false, "Delete local files for contacts deleted in Google")
+		dedup         = flag.Bool("dedup", false, "Delete duplicate contacts in Google, keeping the most recently updated copy")
 	)
 	flag.Parse()
 
@@ -32,16 +33,24 @@ func main() {
 
 	ctx := context.Background()
 
-	// Authenticate
 	client, err := auth.NewOAuthClient(ctx, *credFile, *tokenFile)
 	if err != nil {
 		log.Fatalf("Auth error: %v\n\nRun with valid credentials.json downloaded from Google Cloud Console.\nSee README.md for setup instructions.", err)
 	}
 
-	// Build services
 	contactSvc, err := contacts.NewService(ctx, client)
 	if err != nil {
 		log.Fatalf("Failed to create contacts service: %v", err)
+	}
+
+	if *dedup {
+		fmt.Println("→ Deduplicating Google Contacts…")
+		deleted, err := contactSvc.Dedup(ctx, *dryRun, *verbose)
+		if err != nil {
+			log.Fatalf("Dedup failed: %v", err)
+		}
+		fmt.Printf("Done. %d duplicate(s) deleted.\n", deleted)
+		return
 	}
 
 	if err := os.MkdirAll(*dir, 0o755); err != nil {

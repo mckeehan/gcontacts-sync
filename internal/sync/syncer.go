@@ -25,7 +25,8 @@ type Options struct {
 	UpdateDelay time.Duration
 	// DeleteOrphans removes local .md files whose resource_name no longer
 	// exists in Google (i.e. the contact was deleted on the server).
-	// When false (default) orphaned files are reported as warnings but kept.
+	// Only files that have a synced_hash (previously pulled from Google) are
+	// deleted. Files without a synced_hash have their IDs cleared instead.
 	DeleteOrphans bool
 }
 
@@ -44,7 +45,6 @@ func NewSyncer(google *contacts.Service, store *markdown.Store, opts Options) *S
 	return &Syncer{google: google, store: store, opts: opts}
 }
 
-// throttle pauses between write API calls unless DryRun is active.
 func (s *Syncer) throttle(ctx context.Context) {
 	if s.opts.DryRun {
 		return
@@ -55,9 +55,48 @@ func (s *Syncer) throttle(ctx context.Context) {
 	}
 }
 
+// createAndWriteBack creates a contact in Google, fetches it back fully, and
+// writes the fetched record to the original local file path. This guarantees
+// the local file always ends up with the canonical Google data including
+// resource_name, etag, display_name, synced_hash, and updated_at.
+func (s *Syncer) createAndWriteBack(ctx context.Context, lc *model.Contact, r *Report) bool {
+	created, err := s.google.Create(ctx, lc)
+	if err != nil {
+		r.Errors = append(r.Errors, fmt.Errorf("creating %q in Google: %w", lc.Key(), err))
+		return false
+	}
+	s.logf("  created in Google: resource_name=%s", created.ResourceName)
+
+	// Fetch back so we have all fields Google populates (display_name, groups, etc).
+	fetched, err := s.google.Get(ctx, created.ResourceName)
+	if err != nil {
+		r.Errors = append(r.Errors, fmt.Errorf("fetching new contact %q from Google: %w", lc.Key(), err))
+		return false
+	}
+	s.logf("  fetched from Google: display_name=%q resource_name=%s", fetched.DisplayName, fetched.ResourceName)
+
+	// Preserve local notes if Google didn't store them.
+	if fetched.Notes == "" {
+		fetched.Notes = lc.Notes
+	}
+
+	// Write to the original file path (lc.FilePath set by ReadAll).
+	// This is critical: we must NOT use store.Path(fetched) because that
+	// derives the path from fetched.DisplayName which may differ from the
+	// original filename, leaving the old file untouched with no resource_name.
+	if lc.FilePath == "" {
+		r.Errors = append(r.Errors, fmt.Errorf("contact %q has no FilePath — cannot write back", lc.Key()))
+		return false
+	}
+	if err := s.store.WriteToPath(lc.FilePath, fetched); err != nil {
+		r.Errors = append(r.Errors, fmt.Errorf("writing back %q to %s: %w", lc.Key(), lc.FilePath, err))
+		return false
+	}
+	s.logf("  wrote back to %s (resource_name=%s synced_hash set)", lc.FilePath, fetched.ResourceName)
+	return true
+}
+
 // Pull fetches all Google Contacts and writes/updates Markdown files.
-// Local files whose resource_name no longer exists in Google are deleted
-// (if DeleteOrphans is set) or reported as warnings.
 func (s *Syncer) Pull(ctx context.Context) (*Report, error) {
 	r := &Report{Mode: "pull"}
 
@@ -66,32 +105,23 @@ func (s *Syncer) Pull(ctx context.Context) (*Report, error) {
 		return nil, err
 	}
 
-	// Index remote by resource name so we can detect orphans.
 	remoteByResource := make(map[string]struct{}, len(remote))
 	for _, c := range remote {
 		remoteByResource[c.ResourceName] = struct{}{}
 	}
 
-	// Track paths written during this pull so filename collisions don't get
-	// misreported as updates (two contacts with the same sanitised name would
-	// otherwise hit the else-branch on the second iteration).
 	writtenThisRun := make(map[string]struct{}, len(remote))
 
 	for _, c := range remote {
 		path := s.store.Path(c)
-
-		// If this path was already written this run (filename collision), make
-		// it unique by appending the short numeric suffix of the resource name.
 		if _, collision := writtenThisRun[path]; collision {
 			path = deduplicatePath(path, c.ResourceName)
 		}
 
 		existing, readErr := s.store.Read(path)
-
-		if readErr != nil || isWrittenThisRun(writtenThisRun, path) {
-			// New file (or collision-deduplicated path)
+		if readErr != nil {
 			if !s.opts.DryRun {
-				if err := os.WriteFile(path, mustMarshal(c), 0o644); err != nil {
+				if err := s.store.WriteToPath(path, c); err != nil {
 					r.Errors = append(r.Errors, fmt.Errorf("writing %s: %w", path, err))
 					continue
 				}
@@ -100,13 +130,12 @@ func (s *Syncer) Pull(ctx context.Context) (*Report, error) {
 			r.Created = append(r.Created, c.Key())
 			s.logf("CREATE %s", path)
 		} else {
-			// File exists - update only if Google's version is newer
 			if c.UpdatedAt.Truncate(time.Second).After(existing.UpdatedAt.Truncate(time.Second)) {
 				if c.Notes == "" && existing.Notes != "" {
 					c.Notes = existing.Notes
 				}
 				if !s.opts.DryRun {
-					if err := os.WriteFile(path, mustMarshal(c), 0o644); err != nil {
+					if err := s.store.WriteToPath(path, c); err != nil {
 						r.Errors = append(r.Errors, fmt.Errorf("updating %s: %w", path, err))
 						continue
 					}
@@ -122,19 +151,16 @@ func (s *Syncer) Pull(ctx context.Context) (*Report, error) {
 		}
 	}
 
-	// Orphan sweep: local files with a resource_name Google no longer knows about.
-	if err := s.sweepOrphans(ctx, remoteByResource, r); err != nil {
+	if err := s.sweepOrphans(remoteByResource, r); err != nil {
 		return nil, err
 	}
-
 	return r, nil
 }
 
-// Push reads all Markdown files and creates/updates Google Contacts accordingly.
+// Push reads all Markdown files and creates/updates Google Contacts.
 func (s *Syncer) Push(ctx context.Context) (*Report, error) {
 	r := &Report{Mode: "push"}
 
-	// Fetch the current ETag index from Google so we never need a per-contact Get.
 	etagCache, err := s.buildETagCache(ctx)
 	if err != nil {
 		return nil, err
@@ -147,33 +173,25 @@ func (s *Syncer) Push(ctx context.Context) (*Report, error) {
 
 	for _, c := range local {
 		if c.ResourceName == "" {
-			// New contact - create it
+			s.logf("CREATE %q -> Google (FilePath=%s)", c.Key(), c.FilePath)
 			if !s.opts.DryRun {
-				created, err := s.google.Create(ctx, c)
-				if err != nil {
-					r.Errors = append(r.Errors, fmt.Errorf("creating %q: %w", c.Key(), err))
+				if ok := s.createAndWriteBack(ctx, c, r); !ok {
 					continue
-				}
-				created.Notes = c.Notes
-				if err := s.store.Write(created); err != nil {
-					r.Errors = append(r.Errors, fmt.Errorf("writing back %q: %w", c.Key(), err))
 				}
 				s.throttle(ctx)
 			}
 			r.Created = append(r.Created, c.Key())
-			s.logf("CREATE %q in Google", c.Key())
 		} else {
-			// Existing contact - update it using the cached ETag
 			freshETag := etagCache[c.ResourceName]
 			if !s.opts.DryRun {
 				if _, err := s.google.UpdateWithCache(ctx, c, freshETag); err != nil {
 					if errors.Is(err, contacts.ErrNotFound) {
 						c.ResourceName = ""
 						c.ETag = ""
-						if writeErr := s.store.Write(c); writeErr != nil {
-							r.Errors = append(r.Errors, fmt.Errorf("clearing resource_name for %q: %w", c.Key(), writeErr))
+						if err := s.store.WriteToPath(c.FilePath, c); err != nil {
+							r.Errors = append(r.Errors, fmt.Errorf("clearing resource_name for %q: %w", c.Key(), err))
 						}
-						r.Warnings = append(r.Warnings, c.Key()+" - not found on server (merged?), cleared resource_name")
+						r.Warnings = append(r.Warnings, c.Key()+" - not found on server, cleared resource_name")
 						s.logf("WARN   %q not found on server, resource_name cleared", c.Key())
 						continue
 					}
@@ -190,8 +208,7 @@ func (s *Syncer) Push(ctx context.Context) (*Report, error) {
 	return r, nil
 }
 
-// Sync performs a bidirectional sync using last-modified timestamps to resolve conflicts.
-// Google Contact wins on conflict (last-write wins per source).
+// Sync performs a bidirectional sync.
 func (s *Syncer) Sync(ctx context.Context) (*Report, error) {
 	r := &Report{Mode: "sync"}
 
@@ -200,7 +217,6 @@ func (s *Syncer) Sync(ctx context.Context) (*Report, error) {
 		return nil, err
 	}
 
-	// Index remote by resource name; also build ETag cache inline.
 	remoteByResource := make(map[string]struct{}, len(remote))
 	etagCache := make(map[string]string, len(remote))
 	for _, c := range remote {
@@ -220,15 +236,24 @@ func (s *Syncer) Sync(ctx context.Context) (*Report, error) {
 		}
 	}
 
-	// --- Pull: remote -> local ---
+	writtenPaths := make(map[string]struct{})
+
+	// --- Pull pass: remote -> local ---
 	for _, rc := range remote {
 		lc, exists := localByResource[rc.ResourceName]
 		if !exists {
+			path := s.store.Path(rc)
+			if _, alreadyWritten := writtenPaths[path]; alreadyWritten {
+				s.logf("SKIP   %s (duplicate in Google, run --dedup to clean up)", path)
+				continue
+			}
 			if !s.opts.DryRun {
-				if err := s.store.Write(rc); err != nil {
+				if err := s.store.WriteToPath(path, rc); err != nil {
 					r.Errors = append(r.Errors, err)
 					continue
 				}
+				writtenPaths[path] = struct{}{}
+				remoteByResource[rc.ResourceName] = struct{}{}
 			}
 			r.Created = append(r.Created, rc.Key()+" (-> local)")
 			s.logf("CREATE local %s", markdown.Filename(rc))
@@ -240,10 +265,9 @@ func (s *Syncer) Sync(ctx context.Context) (*Report, error) {
 
 		switch {
 		case googleNewer && !localMod:
-			// Google changed, local untouched — pull down.
 			rc.Notes = mergeNotes(rc.Notes, lc.Notes)
 			if !s.opts.DryRun {
-				if err := s.store.Write(rc); err != nil {
+				if err := s.store.WriteToPath(lc.FilePath, rc); err != nil {
 					r.Errors = append(r.Errors, err)
 					continue
 				}
@@ -252,13 +276,11 @@ func (s *Syncer) Sync(ctx context.Context) (*Report, error) {
 			s.logf("UPDATE local %s (Google newer)", markdown.Filename(rc))
 
 		case localMod && !googleNewer:
-			// Local edited, Google unchanged — push up.
 			freshETag := etagCache[lc.ResourceName]
 			if !s.opts.DryRun {
 				if _, err := s.google.UpdateWithCache(ctx, lc, freshETag); err != nil {
 					if errors.Is(err, contacts.ErrNotFound) {
-						r.Warnings = append(r.Warnings, lc.Key()+" - not found on server (merged?), will re-pull on next run")
-						s.logf("WARN   %q not found on server during push, skipping", lc.Key())
+						r.Warnings = append(r.Warnings, lc.Key()+" - not found on server, will re-pull on next run")
 						continue
 					}
 					r.Errors = append(r.Errors, err)
@@ -270,56 +292,105 @@ func (s *Syncer) Sync(ctx context.Context) (*Report, error) {
 			s.logf("UPDATE Google %q (local edited)", lc.Key())
 
 		case googleNewer && localMod:
-			// Both changed — Google wins; warn the user.
 			rc.Notes = mergeNotes(rc.Notes, lc.Notes)
 			if !s.opts.DryRun {
-				if err := s.store.Write(rc); err != nil {
+				if err := s.store.WriteToPath(lc.FilePath, rc); err != nil {
 					r.Errors = append(r.Errors, err)
 					continue
 				}
 			}
-			r.Updated = append(r.Updated, rc.Key()+" (Google -> local, conflict)")
+			r.Updated = append(r.Updated, rc.Key()+" (conflict: Google wins)")
 			r.Warnings = append(r.Warnings, lc.Key()+" - edited both locally and in Google; Google version kept")
 			s.logf("CONFLICT %s (Google wins)", markdown.Filename(rc))
 
 		default:
-			// Neither changed.
 			r.Unchanged = append(r.Unchanged, rc.Key())
 			s.logf("SKIP   %s", markdown.Filename(rc))
 		}
 	}
 
-	// --- Push: local-only contacts to Google ---
+	// --- Push pass: local-only contacts -> Google ---
+	createdThisRun := make(map[string]struct{})
+
 	for _, lc := range local {
-		if lc.ResourceName == "" {
-			if !s.opts.DryRun {
-				created, err := s.google.Create(ctx, lc)
-				if err != nil {
-					r.Errors = append(r.Errors, err)
-					continue
-				}
-				created.Notes = lc.Notes
-				if err := s.store.Write(created); err != nil {
-					r.Errors = append(r.Errors, err)
-				}
-				s.throttle(ctx)
-			}
-			r.Created = append(r.Created, lc.Key()+" (-> Google)")
-			s.logf("CREATE Google %q", lc.Key())
+		if lc.ResourceName != "" {
+			continue
 		}
+		s.logf("CREATE %q -> Google (FilePath=%s)", lc.Key(), lc.FilePath)
+		if !s.opts.DryRun {
+			if ok := s.createAndWriteBack(ctx, lc, r); !ok {
+				continue
+			}
+			// Read back the file we just wrote to get the new resource_name.
+			updated, err := s.store.Read(lc.FilePath)
+			if err == nil {
+				createdThisRun[updated.ResourceName] = struct{}{}
+			}
+			s.throttle(ctx)
+		}
+		r.Created = append(r.Created, lc.Key()+" (-> Google)")
 	}
 
-	// Orphan sweep: local files with a resource_name Google no longer knows about.
-	if err := s.sweepOrphans(ctx, remoteByResource, r); err != nil {
+	for rn := range createdThisRun {
+		remoteByResource[rn] = struct{}{}
+	}
+
+	if err := s.sweepOrphans(remoteByResource, r); err != nil {
 		return nil, err
 	}
-
 	return r, nil
 }
 
-// buildETagCache does a single ListAll and returns a map of resourceName -> ETag.
-// This is used by Push (which does not otherwise call ListAll) so we have fresh
-// ETags without any per-contact Get calls.
+// sweepOrphans handles local files whose resource_name is not in Google.
+// Files with a synced_hash (previously pulled successfully) are deleted when
+// DeleteOrphans is set. Files without a synced_hash have their IDs cleared
+// so they are re-created on the next sync.
+func (s *Syncer) sweepOrphans(remoteByResource map[string]struct{}, r *Report) error {
+	local, err := s.store.ReadAll()
+	if err != nil {
+		return fmt.Errorf("sweepOrphans: %w", err)
+	}
+
+	for _, lc := range local {
+		if lc.ResourceName == "" {
+			continue
+		}
+		if _, exists := remoteByResource[lc.ResourceName]; exists {
+			continue
+		}
+
+		wasEverSynced := lc.SyncedHash != ""
+
+		if s.opts.DeleteOrphans && wasEverSynced {
+			if !s.opts.DryRun {
+				if err := os.Remove(lc.FilePath); err != nil {
+					r.Errors = append(r.Errors, fmt.Errorf("deleting orphan %q: %w", lc.FilePath, err))
+					continue
+				}
+			}
+			r.Deleted = append(r.Deleted, lc.Key())
+			s.logf("DELETE %s (deleted on Google)", lc.FilePath)
+		} else {
+			lc.ResourceName = ""
+			lc.ETag = ""
+			lc.SyncedHash = ""
+			if !s.opts.DryRun {
+				if err := s.store.WriteToPath(lc.FilePath, lc); err != nil {
+					r.Errors = append(r.Errors, fmt.Errorf("clearing stale IDs for %q: %w", lc.FilePath, err))
+					continue
+				}
+			}
+			msg := lc.Key() + " — not found in Google, IDs cleared; will re-create on next sync"
+			if wasEverSynced {
+				msg = lc.Key() + " — deleted in Google; run with --delete-orphans to remove local file"
+			}
+			r.Warnings = append(r.Warnings, msg)
+			s.logf("WARN   %s", msg)
+		}
+	}
+	return nil
+}
+
 func (s *Syncer) buildETagCache(ctx context.Context) (map[string]string, error) {
 	remote, err := s.google.ListAll(ctx)
 	if err != nil {
@@ -339,11 +410,7 @@ func mergeNotes(googleNotes, localNotes string) string {
 	return localNotes
 }
 
-// deduplicatePath appends the last numeric segment of a resource name to a
-// path stem to resolve filename collisions, e.g.
-// "contacts/John-Smith.md" + "people/c9876" -> "contacts/John-Smith-9876.md"
 func deduplicatePath(path, resourceName string) string {
-	// Extract trailing digits from the resource name.
 	suffix := resourceName
 	if idx := strings.LastIndexAny(resourceName, "/c"); idx >= 0 {
 		suffix = resourceName[idx+1:]
@@ -351,67 +418,14 @@ func deduplicatePath(path, resourceName string) string {
 	if suffix == "" || suffix == resourceName {
 		suffix = strings.ReplaceAll(resourceName, "/", "-")
 	}
-	// Insert before the .md extension.
 	if strings.HasSuffix(path, ".md") {
 		return path[:len(path)-3] + "-" + suffix + ".md"
 	}
 	return path + "-" + suffix
 }
 
-func isWrittenThisRun(m map[string]struct{}, path string) bool {
-	_, ok := m[path]
-	return ok
-}
-
-// mustMarshal marshals a contact to bytes, returning nil on error (the caller
-// checks the write error separately).
-func mustMarshal(c *model.Contact) []byte {
-	b, err := markdown.Marshal(c)
-	if err != nil {
-		return nil
-	}
-	return b
-}
-
 func (s *Syncer) logf(format string, args ...any) {
 	if s.opts.Verbose {
 		fmt.Printf(format+"\n", args...)
 	}
-}
-
-// sweepOrphans scans all local .md files and removes (or warns about) any whose
-// resource_name is not present in remoteByResource.
-// Files with no resource_name at all are local-only new contacts and are skipped.
-func (s *Syncer) sweepOrphans(ctx context.Context, remoteByResource map[string]struct{}, r *Report) error {
-	local, err := s.store.ReadAll()
-	if err != nil {
-		return fmt.Errorf("sweepOrphans reading store: %w", err)
-	}
-
-	for _, lc := range local {
-		if lc.ResourceName == "" {
-			// No resource_name means it was never synced to Google — not an orphan.
-			continue
-		}
-		if _, exists := remoteByResource[lc.ResourceName]; exists {
-			continue
-		}
-
-		// This contact is gone from Google.
-		path := s.store.Path(lc)
-		if s.opts.DeleteOrphans {
-			if !s.opts.DryRun {
-				if err := os.Remove(path); err != nil {
-					r.Errors = append(r.Errors, fmt.Errorf("deleting orphan %q: %w", path, err))
-					continue
-				}
-			}
-			r.Deleted = append(r.Deleted, lc.Key())
-			s.logf("DELETE %s (deleted on Google)", path)
-		} else {
-			r.Warnings = append(r.Warnings, lc.Key()+" - deleted on Google; run with --delete-orphans to remove local file")
-			s.logf("WARN   %s deleted on Google but kept locally (use --delete-orphans)", path)
-		}
-	}
-	return nil
 }

@@ -108,7 +108,9 @@ func TestFilename(t *testing.T) {
 		want string
 	}{
 		{"normal", "Jane Smith", "Jane-Smith.md"},
-		{"special chars", "Ó'Brian, Seán", "Brian-Sen.md"},
+		{"unicode letters preserved", "Ó'Brian, Seán", "ÓBrian-Seán.md"},
+		{"apostrophe stripped", "O'Brien", "OBrien.md"},
+		{"comma stripped", "Smith, John", "Smith-John.md"},
 		{"company with dot", "Acme Corp. Ltd.", "Acme-Corp.-Ltd.md"},
 		{"emoji stripped", "Bob 🚀 Jones", "Bob-Jones.md"},
 		{"slashes stripped", "AC/DC", "ACDC.md"},
